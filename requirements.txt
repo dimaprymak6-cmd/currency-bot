@@ -1,4 +1,4 @@
-aiogram
-requests
-beautifulsoup4
-apscheduler
+python-telegram-bot[job-queue]==21.5
+requests==2.31.0
+beautifulsoup4==4.12.3
+aiohttp==3.9.1
