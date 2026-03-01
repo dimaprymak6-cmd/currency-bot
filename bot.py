@@ -16,9 +16,9 @@ from telegram import Update
 # ============================================================
 # НАСТРОЙКИ — заполните перед запуском
 # ============================================================
-TELEGRAM_TOKEN = "YOUR_BOT_TOKEN_HERE"   # 8628403556:AAEd9wl3wc9W6NOU7REc__S0M_d9XsNw-Hw
-CHAT_ID = "YOUR_CHAT_ID_HERE"            # 1090802357
-CHECK_INTERVAL = 300                     # интервал проверки в секундах (5 минут)
+TELEGRAM_TOKEN = "8628403556:AAEd9wl3wc9W6NOU7REc__S0M_d9XsNw-Hw"
+CHAT_ID = "1090802357"
+CHECK_INTERVAL = 300
 # ============================================================
 
 SEARCH_URL = "https://999.md/ru/list/food-and-agriculture/fruits-and-berries?eo%5B475%5D=7249"
