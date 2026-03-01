@@ -1,101 +1,54 @@
 import asyncio
+import json
+import logging
+import os
+import re
+import time
+from datetime import datetime
+
+import aiohttp
 import requests
 from bs4 import BeautifulSoup
-from aiogram import Bot, Dispatcher
-from aiogram.types import Message
-from aiogram.filters import Command
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from datetime import datetime
-import os
+from telegram import Bot
+from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ============================================================
+# НАСТРОЙКИ — заполните перед запуском
+# ============================================================
+TELEGRAM_TOKEN = "YOUR_BOT_TOKEN_HERE"   # 8628403556:AAEd9wl3wc9W6NOU7REc__S0M_d9XsNw-Hw
+CHAT_ID = "YOUR_CHAT_ID_HERE"            # 1090802357
+CHECK_INTERVAL = 300                     # интервал проверки в секундах (5 минут)
+# ============================================================
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-scheduler = AsyncIOScheduler()
+SEARCH_URL = "https://999.md/ru/list/food-and-agriculture/fruits-and-berries?eo%5B475%5D=7249"
+# Если нужен конкретный поиск по слову "яблок":
+# SEARCH_URL = "https://999.md/ru/list/food-and-agriculture/fruits-and-berries?q=%D1%8F%D0%B1%D0%BB%D0%BE%D0%BA%D0%B0"
 
-def get_currency():
-    url = "https://www.deghest.md/curscentru"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers, timeout=10)
+SEEN_IDS_FILE = "seen_ids.json"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9",
+}
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    rows = soup.find_all("tr")
-
-    result = "💱 Курс валют (Deghest):\n\n"
-
-    for row in rows:
-        cols = row.find_all("td")
-        if len(cols) >= 3:
-            currency = cols[0].text.strip()
-            buy = cols[1].text.strip()
-            sell = cols[2].text.strip()
-
-            if currency and buy and sell:
-                result += f"💵 {currency}\nПокупка: {buy}\nПродажа: {sell}\n\n"
-
-    if len(result) < 20:
-        return "Не удалось получить курс валют 😔"
-
-    return result
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 
-async def send_currency(chat_id):
-    text = get_currency()
-    await bot.send_message(
-        chat_id,
-        f"{text}\n📅 {datetime.now().strftime('%d.%m.%Y')}"
-    )
+def load_seen_ids() -> set:
+    if os.path.exists(SEEN_IDS_FILE):
+        with open(SEEN_IDS_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
 
 
-def schedule_user(chat_id, hour, minute):
-    scheduler.add_job(
-        send_currency,
-        "cron",
-        hour=hour,
-        minute=minute,
-        args=[chat_id],
-        id=str(chat_id),
-        replace_existing=True
-    )
-
-
-@dp.message(Command("start"))
-async def start_handler(message: Message):
-    await message.answer(
-        "🤖 Бот курса валют запущен!\n\n"
-        "Команды:\n"
-        "/time 09:30 — установить время\n"
-        "/now — показать курс сейчас"
-    )
-
-
-@dp.message(Command("now"))
-async def now_handler(message: Message):
-    await send_currency(message.chat.id)
-
-
-@dp.message(Command("time"))
-async def time_handler(message: Message):
-    try:
-        time_text = message.text.split()[1]
-        hour, minute = map(int, time_text.split(":"))
-
-        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-            raise ValueError
-
-        schedule_user(message.chat.id, hour, minute)
-
-        await message.answer(f"✅ Время установлено: {hour:02d}:{minute:02d}")
-
-    except:
-        await message.answer("❌ Используй формат: /time 09:30")
-
-
-async def main():
-    scheduler.start()
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+def save_seen_ids(ids: set):
+    with open(SEEN_IDS_FILE, "w") as f:
+        json.dump(list(ids), f)
