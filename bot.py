@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-# Переменные берутся из Railway → Variables
+# Переменные берутся из Railway -> Variables
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
@@ -44,7 +44,12 @@ def save_seen_ids(ids: set):
 
 
 def load_status() -> dict:
-    default = {"monitoring": False, "last_check": "Ещё не проверялось", "total_found": 0}
+    default = {
+        "monitoring": False,
+        "last_check": "Ещё не проверялось",
+        "total_found": 0,
+        "check_count": 0,
+    }
     if os.path.exists(STATUS_FILE):
         try:
             with open(STATUS_FILE, "r") as f:
@@ -59,13 +64,14 @@ def save_status(status: dict):
         json.dump(status, f, ensure_ascii=False)
 
 
-def fetch_listings() -> list:
+def fetch_listings():
+    """Возвращает список объявлений или None при ошибке сети."""
     try:
         response = requests.get(SEARCH_URL, headers=HEADERS, timeout=15)
         response.raise_for_status()
     except Exception as e:
         logger.error(f"Ошибка загрузки: {e}")
-        return []
+        return None
 
     soup = BeautifulSoup(response.text, "html.parser")
     listings = []
@@ -118,6 +124,7 @@ def back_keyboard() -> InlineKeyboardMarkup:
 
 
 async def send_listing_notification(bot: Bot, listing: dict):
+    """Громкое уведомление о новом объявлении."""
     title = escape_md(listing["title"])
     price = escape_md(listing["price"])
     time_str = escape_md(datetime.now().strftime("%d.%m.%Y %H:%M"))
@@ -132,11 +139,48 @@ async def send_listing_notification(bot: Bot, listing: dict):
     )
     try:
         await bot.send_message(
-            chat_id=CHAT_ID, text=text, parse_mode="MarkdownV2",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👁 Смотреть на 999.md", url=url)]])
+            chat_id=CHAT_ID,
+            text=text,
+            parse_mode="MarkdownV2",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👁 Смотреть на 999.md", url=url)]]),
+            disable_notification=False,  # громкое
         )
     except Exception as e:
-        logger.error(f"Ошибка отправки: {e}")
+        logger.error(f"Ошибка отправки уведомления: {e}")
+
+
+async def send_check_report(bot: Bot, new_count: int, total_checked: int, error: bool = False):
+    """Тихое сообщение после каждой автопроверки — чтобы было видно что бот работает."""
+    now = escape_md(datetime.now().strftime("%H:%M"))
+    interval = escape_md(str(CHECK_INTERVAL // 60))
+
+    if error:
+        text = (
+            f"⚠️ `{now}` — Ошибка подключения к 999\\.md\n"
+            f"Следующая попытка через {interval} мин\\."
+        )
+    elif new_count > 0:
+        text = (
+            f"🍎 `{now}` — Найдено новых: *{new_count}* шт\\.\n"
+            f"Уведомления отправлены выше 👆"
+        )
+    else:
+        total = escape_md(str(total_checked))
+        text = (
+            f"🔄 `{now}` — Проверка выполнена\\.\n"
+            f"На странице объявлений с яблоками: {total}\n"
+            f"Новых нет\\. Следующая проверка через {interval} мин\\."
+        )
+
+    try:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=text,
+            parse_mode="MarkdownV2",
+            disable_notification=True,  # тихое — не будет звука
+        )
+    except Exception as e:
+        logger.error(f"Ошибка отправки отчёта: {e}")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -165,10 +209,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status["monitoring"] = True
         save_status(status)
         if not context.job_queue.get_jobs_by_name("monitor"):
-            context.job_queue.run_repeating(auto_check_job, interval=CHECK_INTERVAL, first=5, name="monitor")
+            context.job_queue.run_repeating(
+                auto_check_job, interval=CHECK_INTERVAL, first=5, name="monitor"
+            )
         await query.edit_message_text(
-            f"✅ *Мониторинг запущен\\!*\n\nПроверяю каждые *{CHECK_INTERVAL // 60} минут*\\.\nПри новых объявлениях сразу пришлю уведомление 📬",
-            parse_mode="MarkdownV2", reply_markup=main_keyboard(True)
+            f"✅ *Мониторинг запущен\\!*\n\n"
+            f"Проверяю каждые *{CHECK_INTERVAL // 60} минут*\\.\n\n"
+            f"📋 После каждой проверки — *тихое* сообщение с результатом\\.\n"
+            f"🔔 При новом объявлении — *громкое* уведомление\\!",
+            parse_mode="MarkdownV2",
+            reply_markup=main_keyboard(True),
         )
 
     elif data == "stop":
@@ -178,38 +228,61 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             job.schedule_removal()
         await query.edit_message_text(
             "⏸ *Мониторинг остановлен*\n\nНажмите *Запустить мониторинг*, чтобы возобновить\\.",
-            parse_mode="MarkdownV2", reply_markup=main_keyboard(False)
+            parse_mode="MarkdownV2",
+            reply_markup=main_keyboard(False),
         )
 
     elif data == "check_now":
-        await query.edit_message_text("🔍 *Проверяю объявления\\.\\.\\.*\n\nПодождите немного\\.", parse_mode="MarkdownV2")
+        await query.edit_message_text(
+            "🔍 *Проверяю объявления\\.\\.\\.*\n\nПодождите немного\\.",
+            parse_mode="MarkdownV2",
+        )
         seen_ids = load_seen_ids()
         listings = fetch_listings()
-        new_listings = [l for l in listings if l["id"] not in seen_ids]
-        if new_listings:
-            for listing in new_listings:
-                await send_listing_notification(context.bot, listing)
-                seen_ids.add(listing["id"])
-            save_seen_ids(seen_ids)
-            status["total_found"] = status.get("total_found", 0) + len(new_listings)
-            status["last_check"] = datetime.now().strftime("%d.%m.%Y %H:%M")
-            save_status(status)
-            result = f"✅ *Проверка завершена\\!*\n\n🆕 Новых объявлений: *{len(new_listings)}*\n📤 Уведомления отправлены выше\\."
+
+        if listings is None:
+            result = "❌ *Ошибка подключения к 999\\.md*\n\nПопробуйте позже\\."
         else:
+            new_listings = [l for l in listings if l["id"] not in seen_ids]
+            if new_listings:
+                for listing in new_listings:
+                    await send_listing_notification(context.bot, listing)
+                    seen_ids.add(listing["id"])
+                save_seen_ids(seen_ids)
+                status["total_found"] = status.get("total_found", 0) + len(new_listings)
+                result = (
+                    f"✅ *Найдено новых объявлений: {len(new_listings)}*\n\n"
+                    f"📤 Уведомления отправлены выше\\!"
+                )
+            else:
+                result = (
+                    f"✅ *Проверка завершена\\!*\n\n"
+                    f"📭 Новых объявлений нет\\.\n"
+                    f"Объявлений с яблоками на странице: {escape_md(str(len(listings)))} шт\\."
+                )
             status["last_check"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+            status["check_count"] = status.get("check_count", 0) + 1
             save_status(status)
-            result = f"✅ *Проверка завершена\\!*\n\n📭 Новых объявлений не найдено\\.\nПроверено: {escape_md(str(len(listings)))} объявлений\\."
-        await query.edit_message_text(result, parse_mode="MarkdownV2", reply_markup=main_keyboard(status.get("monitoring", False)))
+
+        await query.edit_message_text(
+            result,
+            parse_mode="MarkdownV2",
+            reply_markup=main_keyboard(status.get("monitoring", False)),
+        )
 
     elif data == "status":
         mon = status.get("monitoring", False)
+        last = escape_md(status.get("last_check", "Ещё не проверялось"))
         text = (
-            "📊 *Статус мониторинга*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📊 *Статус мониторинга*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📡 Состояние: {'🟢 Активен' if mon else '🔴 Остановлен'}\n"
-            f"⏱ Интервал: каждые {CHECK_INTERVAL // 60} мин\\.\n"
-            f"🕐 Последняя проверка: {escape_md(status.get('last_check', 'Ещё не проверялось'))}\n"
+            f"⏱ Интервал проверки: каждые {CHECK_INTERVAL // 60} мин\\.\n"
+            f"🕐 Последняя проверка: {last}\n"
+            f"🔁 Всего проверок: {status.get('check_count', 0)}\n"
             f"📦 В кэше объявлений: {len(load_seen_ids())}\n"
-            f"📬 Всего уведомлений отправлено: {status.get('total_found', 0)}"
+            f"📬 Найдено новых за всё время: {status.get('total_found', 0)}\n\n"
+            f"_Тихие сообщения после каждой проверки показывают что бот работает\\._"
         )
         await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=back_keyboard())
 
@@ -217,19 +290,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         old_count = len(load_seen_ids())
         save_seen_ids(set())
         await query.edit_message_text(
-            f"🗑 *Кэш сброшен\\!*\n\nУдалено записей: *{old_count}*\n\nПри следующей проверке все объявления будут показаны как новые\\.",
-            parse_mode="MarkdownV2", reply_markup=back_keyboard()
+            f"🗑 *Кэш сброшен\\!*\n\n"
+            f"Удалено записей: *{old_count}*\n\n"
+            f"При следующей проверке все текущие объявления будут показаны как новые\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=back_keyboard(),
         )
 
     elif data == "help":
         text = (
-            "ℹ️ *Справка по боту*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            "ℹ️ *Справка по боту*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
             f"▶️ *Запустить мониторинг* — автопроверка каждые {CHECK_INTERVAL // 60} мин\\.\n\n"
             "⏸ *Остановить мониторинг* — отключить автопроверку\\.\n\n"
             "🔍 *Проверить сейчас* — немедленная ручная проверка\\.\n\n"
-            "📊 *Статус* — состояние и статистика\\.\n\n"
-            "🗑 *Сбросить кэш* — показать все объявления снова\\.\n\n"
+            "📊 *Статус* — состояние бота и статистика\\.\n\n"
+            "🗑 *Сбросить кэш* — показать все объявления снова как новые\\.\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
+            "🔔 *Типы уведомлений:*\n"
+            "• Новое объявление — громкое 🔔\n"
+            "• Нет новых — тихое 🔕 \\(виден счётчик на иконке\\)\n\n"
             "🔑 *Ключевые слова:* яблок, яблоко, mere, apple, mar"
         )
         await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=back_keyboard())
@@ -246,44 +326,58 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def auto_check_job(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача — запускается автоматически каждые CHECK_INTERVAL секунд."""
     status = load_status()
     if not status.get("monitoring", False):
         return
-    logger.info("⏱ Автопроверка...")
+
+    logger.info("Auto-check running...")
     seen_ids = load_seen_ids()
     listings = fetch_listings()
+
+    if listings is None:
+        await send_check_report(context.bot, 0, 0, error=True)
+        return
+
     new_listings = [l for l in listings if l["id"] not in seen_ids]
+
     if new_listings:
         for listing in new_listings:
             await send_listing_notification(context.bot, listing)
             seen_ids.add(listing["id"])
         save_seen_ids(seen_ids)
         status["total_found"] = status.get("total_found", 0) + len(new_listings)
-        logger.info(f"Отправлено {len(new_listings)} уведомлений")
-    else:
-        logger.info("Новых объявлений нет")
+        logger.info(f"Sent {len(new_listings)} notifications")
+
+    # Тихий отчёт о результате проверки
+    await send_check_report(context.bot, len(new_listings), len(listings))
+
     status["last_check"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+    status["check_count"] = status.get("check_count", 0) + 1
     save_status(status)
 
 
 def main():
     if not TELEGRAM_TOKEN:
-        print("ОШИБКА: TELEGRAM_TOKEN не задан в Railway Variables!")
+        print("ERROR: TELEGRAM_TOKEN not set in Railway Variables!")
         return
     if not CHAT_ID:
-        print("ОШИБКА: CHAT_ID не задан в Railway Variables!")
+        print("ERROR: CHAT_ID not set in Railway Variables!")
         return
 
-    print(f"Бот запущен. Интервал: {CHECK_INTERVAL} сек.")
+    print(f"Bot started. Interval: {CHECK_INTERVAL}s")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(button_handler))
 
+    # Восстанавливаем мониторинг после перезапуска
     status = load_status()
     if status.get("monitoring"):
         async def restore(application):
-            application.job_queue.run_repeating(auto_check_job, interval=CHECK_INTERVAL, first=15, name="monitor")
+            application.job_queue.run_repeating(
+                auto_check_job, interval=CHECK_INTERVAL, first=15, name="monitor"
+            )
         app.post_init = restore
 
     app.run_polling(drop_pending_updates=True)
