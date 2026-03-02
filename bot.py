@@ -1,54 +1,293 @@
-import asyncio
 import json
 import logging
 import os
 import re
-import time
 from datetime import datetime
 
-import aiohttp
 import requests
 from bs4 import BeautifulSoup
-from telegram import Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram import Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-# ============================================================
-# НАСТРОЙКИ — заполните перед запуском
-# ============================================================
-TELEGRAM_TOKEN = "8628403556:AAEd9wl3wc9W6NOU7REc__S0M_d9XsNw-Hw"
-CHAT_ID = "1090802357"
-CHECK_INTERVAL = 300
-# ============================================================
+# Переменные берутся из Railway → Variables
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
 
-SEARCH_URL = "https://999.md/ru/list/food-and-agriculture/fruits-and-berries?eo%5B475%5D=7249"
-# Если нужен конкретный поиск по слову "яблок":
-# SEARCH_URL = "https://999.md/ru/list/food-and-agriculture/fruits-and-berries?q=%D1%8F%D0%B1%D0%BB%D0%BE%D0%BA%D0%B0"
+KEYWORDS = ["яблок", "яблоко", "mere", "apple", "mar"]
+SEARCH_URL = "https://999.md/ru/list/food-and-agriculture/fruits-and-berries"
+SEEN_IDS_FILE = "/tmp/seen_ids.json"
+STATUS_FILE = "/tmp/status.json"
 
-SEEN_IDS_FILE = "seen_ids.json"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ru-RU,ru;q=0.9",
-}
-
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+}
 
 
 def load_seen_ids() -> set:
     if os.path.exists(SEEN_IDS_FILE):
-        with open(SEEN_IDS_FILE, "r") as f:
-            return set(json.load(f))
+        try:
+            with open(SEEN_IDS_FILE, "r") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
     return set()
 
 
 def save_seen_ids(ids: set):
     with open(SEEN_IDS_FILE, "w") as f:
         json.dump(list(ids), f)
+
+
+def load_status() -> dict:
+    default = {"monitoring": False, "last_check": "Ещё не проверялось", "total_found": 0}
+    if os.path.exists(STATUS_FILE):
+        try:
+            with open(STATUS_FILE, "r") as f:
+                return {**default, **json.load(f)}
+        except Exception:
+            return default
+    return default
+
+
+def save_status(status: dict):
+    with open(STATUS_FILE, "w") as f:
+        json.dump(status, f, ensure_ascii=False)
+
+
+def fetch_listings() -> list:
+    try:
+        response = requests.get(SEARCH_URL, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+    except Exception as e:
+        logger.error(f"Ошибка загрузки: {e}")
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    listings = []
+
+    for item in soup.select("li.ads-list-photo-item"):
+        try:
+            link_tag = item.select_one("a.ads-list-photo-item-title")
+            if not link_tag:
+                continue
+            href = link_tag.get("href", "")
+            title = link_tag.get_text(strip=True)
+            if not any(kw in title.lower() for kw in KEYWORDS):
+                continue
+            ad_id_match = re.search(r"/(\d+)$", href)
+            if not ad_id_match:
+                continue
+            ad_id = ad_id_match.group(1)
+            price_tag = item.select_one(".ads-list-photo-item-price-wrapper")
+            price = price_tag.get_text(strip=True) if price_tag else "Договорная"
+            full_url = f"https://999.md{href}" if href.startswith("/") else href
+            listings.append({"id": ad_id, "title": title, "price": price, "url": full_url})
+        except Exception as e:
+            logger.warning(f"Ошибка парсинга: {e}")
+
+    logger.info(f"Найдено объявлений с яблоками: {len(listings)}")
+    return listings
+
+
+def escape_md(text: str) -> str:
+    return re.sub(r"([\_\*\[\]\(\)\~\`\>\#\+\-\=\|\{\}\.\!])", r"\\\1", text)
+
+
+def main_keyboard(monitoring_active: bool) -> InlineKeyboardMarkup:
+    toggle_btn = (
+        InlineKeyboardButton("⏸ Остановить мониторинг", callback_data="stop")
+        if monitoring_active
+        else InlineKeyboardButton("▶️ Запустить мониторинг", callback_data="start")
+    )
+    return InlineKeyboardMarkup([
+        [toggle_btn],
+        [InlineKeyboardButton("🔍 Проверить сейчас", callback_data="check_now"),
+         InlineKeyboardButton("📊 Статус", callback_data="status")],
+        [InlineKeyboardButton("🗑 Сбросить кэш", callback_data="clear_cache"),
+         InlineKeyboardButton("ℹ️ Помощь", callback_data="help")],
+    ])
+
+
+def back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]])
+
+
+async def send_listing_notification(bot: Bot, listing: dict):
+    title = escape_md(listing["title"])
+    price = escape_md(listing["price"])
+    time_str = escape_md(datetime.now().strftime("%d.%m.%Y %H:%M"))
+    url = listing["url"]
+    text = (
+        "🍎 *Новое объявление\\!*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📌 *{title}*\n\n"
+        f"💰 Цена: {price}\n"
+        f"🕐 {time_str}\n\n"
+        f"[👁 Открыть объявление]({url})"
+    )
+    try:
+        await bot.send_message(
+            chat_id=CHAT_ID, text=text, parse_mode="MarkdownV2",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👁 Смотреть на 999.md", url=url)]])
+        )
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = load_status()
+    mon = status.get("monitoring", False)
+    text = (
+        "🍎 *Бот мониторинга яблок на 999\\.md*\n\n"
+        "Отслеживает новые объявления и присылает уведомления\\.\n\n"
+        f"📡 Статус: {'🟢 Активен' if mon else '🔴 Остановлен'}\n"
+        f"⏱ Интервал: каждые {CHECK_INTERVAL // 60} мин\\.\n\n"
+        "Нажмите кнопку для управления:"
+    )
+    await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=main_keyboard(mon))
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    status = load_status()
+
+    if data == "start":
+        if status.get("monitoring"):
+            await query.answer("Мониторинг уже запущен!", show_alert=True)
+            return
+        status["monitoring"] = True
+        save_status(status)
+        if not context.job_queue.get_jobs_by_name("monitor"):
+            context.job_queue.run_repeating(auto_check_job, interval=CHECK_INTERVAL, first=5, name="monitor")
+        await query.edit_message_text(
+            f"✅ *Мониторинг запущен\\!*\n\nПроверяю каждые *{CHECK_INTERVAL // 60} минут*\\.\nПри новых объявлениях сразу пришлю уведомление 📬",
+            parse_mode="MarkdownV2", reply_markup=main_keyboard(True)
+        )
+
+    elif data == "stop":
+        status["monitoring"] = False
+        save_status(status)
+        for job in context.job_queue.get_jobs_by_name("monitor"):
+            job.schedule_removal()
+        await query.edit_message_text(
+            "⏸ *Мониторинг остановлен*\n\nНажмите *Запустить мониторинг*, чтобы возобновить\\.",
+            parse_mode="MarkdownV2", reply_markup=main_keyboard(False)
+        )
+
+    elif data == "check_now":
+        await query.edit_message_text("🔍 *Проверяю объявления\\.\\.\\.*\n\nПодождите немного\\.", parse_mode="MarkdownV2")
+        seen_ids = load_seen_ids()
+        listings = fetch_listings()
+        new_listings = [l for l in listings if l["id"] not in seen_ids]
+        if new_listings:
+            for listing in new_listings:
+                await send_listing_notification(context.bot, listing)
+                seen_ids.add(listing["id"])
+            save_seen_ids(seen_ids)
+            status["total_found"] = status.get("total_found", 0) + len(new_listings)
+            status["last_check"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+            save_status(status)
+            result = f"✅ *Проверка завершена\\!*\n\n🆕 Новых объявлений: *{len(new_listings)}*\n📤 Уведомления отправлены выше\\."
+        else:
+            status["last_check"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+            save_status(status)
+            result = f"✅ *Проверка завершена\\!*\n\n📭 Новых объявлений не найдено\\.\nПроверено: {escape_md(str(len(listings)))} объявлений\\."
+        await query.edit_message_text(result, parse_mode="MarkdownV2", reply_markup=main_keyboard(status.get("monitoring", False)))
+
+    elif data == "status":
+        mon = status.get("monitoring", False)
+        text = (
+            "📊 *Статус мониторинга*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📡 Состояние: {'🟢 Активен' if mon else '🔴 Остановлен'}\n"
+            f"⏱ Интервал: каждые {CHECK_INTERVAL // 60} мин\\.\n"
+            f"🕐 Последняя проверка: {escape_md(status.get('last_check', 'Ещё не проверялось'))}\n"
+            f"📦 В кэше объявлений: {len(load_seen_ids())}\n"
+            f"📬 Всего уведомлений отправлено: {status.get('total_found', 0)}"
+        )
+        await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=back_keyboard())
+
+    elif data == "clear_cache":
+        old_count = len(load_seen_ids())
+        save_seen_ids(set())
+        await query.edit_message_text(
+            f"🗑 *Кэш сброшен\\!*\n\nУдалено записей: *{old_count}*\n\nПри следующей проверке все объявления будут показаны как новые\\.",
+            parse_mode="MarkdownV2", reply_markup=back_keyboard()
+        )
+
+    elif data == "help":
+        text = (
+            "ℹ️ *Справка по боту*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"▶️ *Запустить мониторинг* — автопроверка каждые {CHECK_INTERVAL // 60} мин\\.\n\n"
+            "⏸ *Остановить мониторинг* — отключить автопроверку\\.\n\n"
+            "🔍 *Проверить сейчас* — немедленная ручная проверка\\.\n\n"
+            "📊 *Статус* — состояние и статистика\\.\n\n"
+            "🗑 *Сбросить кэш* — показать все объявления снова\\.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🔑 *Ключевые слова:* яблок, яблоко, mere, apple, mar"
+        )
+        await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=back_keyboard())
+
+    elif data == "back_to_main":
+        mon = status.get("monitoring", False)
+        text = (
+            "🍎 *Бот мониторинга яблок на 999\\.md*\n\n"
+            f"📡 Статус: {'🟢 Активен' if mon else '🔴 Остановлен'}\n"
+            f"⏱ Интервал: каждые {CHECK_INTERVAL // 60} мин\\.\n\n"
+            "Нажмите кнопку для управления:"
+        )
+        await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=main_keyboard(mon))
+
+
+async def auto_check_job(context: ContextTypes.DEFAULT_TYPE):
+    status = load_status()
+    if not status.get("monitoring", False):
+        return
+    logger.info("⏱ Автопроверка...")
+    seen_ids = load_seen_ids()
+    listings = fetch_listings()
+    new_listings = [l for l in listings if l["id"] not in seen_ids]
+    if new_listings:
+        for listing in new_listings:
+            await send_listing_notification(context.bot, listing)
+            seen_ids.add(listing["id"])
+        save_seen_ids(seen_ids)
+        status["total_found"] = status.get("total_found", 0) + len(new_listings)
+        logger.info(f"Отправлено {len(new_listings)} уведомлений")
+    else:
+        logger.info("Новых объявлений нет")
+    status["last_check"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+    save_status(status)
+
+
+def main():
+    if not TELEGRAM_TOKEN:
+        print("ОШИБКА: TELEGRAM_TOKEN не задан в Railway Variables!")
+        return
+    if not CHAT_ID:
+        print("ОШИБКА: CHAT_ID не задан в Railway Variables!")
+        return
+
+    print(f"Бот запущен. Интервал: {CHECK_INTERVAL} сек.")
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    status = load_status()
+    if status.get("monitoring"):
+        async def restore(application):
+            application.job_queue.run_repeating(auto_check_job, interval=CHECK_INTERVAL, first=15, name="monitor")
+        app.post_init = restore
+
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
