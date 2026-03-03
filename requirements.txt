@@ -1,3 +1,4 @@
 python-telegram-bot[job-queue]==21.5
 requests==2.31.0
 beautifulsoup4==4.12.3
+cloudscraper==1.2.71
