@@ -20,7 +20,7 @@ CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 
 KEYWORDS = ["яблок", "яблоко", "mere", "apple", "mar", "mar"]
-SEARCH_URL = "https://999.md/ru/list/food-and-agriculture/fruits-and-berries"
+SEARCH_URL = "https://999.md/ru/list/agriculture/vegetables-and-fruits"
 SEEN_IDS_FILE = "/tmp/seen_ids.json"
 STATUS_FILE = "/tmp/status.json"
 
